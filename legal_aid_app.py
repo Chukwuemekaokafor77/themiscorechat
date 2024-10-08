@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 import json
-import faiss
 import numpy as np
 from typing import List, Dict, Any, Generator
 from anthropic import Anthropic
@@ -17,15 +16,19 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+# Try importing faiss
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    st.error("FAISS is not installed. Please check the logs for more information.")
+
 class DocumentStore:
-    def __init__(self, embeddings_path: str, texts_path: str, faiss_index_path: str, batch_size: int = 1000):
-        self.embeddings_path = embeddings_path
-        self.texts_path = texts_path
-        self.faiss_index_path = faiss_index_path
-        self.batch_size = batch_size
-        
-        # Load FAISS index
-        self.index = faiss.read_index(faiss_index_path)
+    def __init__(self, embeddings_data: Dict, texts_data: Dict, faiss_index):
+        self.embeddings_data = embeddings_data
+        self.texts_data = texts_data
+        self.index = faiss_index
         
         # Initialize sentence transformer for query encoding
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -34,39 +37,21 @@ class DocumentStore:
         self._setup_id_mapping()
         
     def _setup_id_mapping(self):
-        """Create mappings between string IDs and integer indices"""
-        self.str_to_int_id = {}
-        self.int_to_str_id = {}
-        
-        with open(self.embeddings_path, 'r') as f:
-            embeddings_data = json.load(f)
-        
-        for idx, str_id in enumerate(embeddings_data.keys()):
-            self.str_to_int_id[str_id] = idx
-            self.int_to_str_id[idx] = str_id
+        self.str_to_int_id = {str_id: idx for idx, str_id in enumerate(self.embeddings_data.keys())}
+        self.int_to_str_id = {idx: str_id for str_id, idx in self.str_to_int_id.items()}
 
     def document_generator(self) -> Generator[Dict[str, Any], None, None]:
-        with open(self.embeddings_path, 'r') as emb_file, open(self.texts_path, 'r') as text_file:
-            embeddings_data = json.load(emb_file)
-            texts_data = json.load(text_file)
-            
-            batch = []
-            for str_id, embedding in embeddings_data.items():
-                if str_id in texts_data:
-                    doc = {
-                        "str_id": str_id,
-                        "int_id": self.str_to_int_id[str_id],
-                        "embedding": embedding,
-                        "text": texts_data[str_id]
-                    }
-                    batch.append(doc)
-                    
-                    if len(batch) == self.batch_size:
-                        yield batch
-                        batch = []
-            
-            if batch:
-                yield batch
+        batch = []
+        for str_id, embedding in self.embeddings_data.items():
+            if str_id in self.texts_data:
+                doc = {
+                    "str_id": str_id,
+                    "int_id": self.str_to_int_id[str_id],
+                    "embedding": embedding,
+                    "text": self.texts_data[str_id]
+                }
+                batch.append(doc)
+        yield batch
 
 class RAGModel:
     def __init__(self, document_store: DocumentStore):
@@ -103,9 +88,7 @@ class RAGModel:
 
 class ClaudeEnhancer:
     def __init__(self):
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+        api_key = st.secrets["ANTHROPIC_API_KEY"]
         self.client = Anthropic(api_key=api_key)
 
     def generate_response(self, query: str, relevant_docs: List[Dict[str, Any]]) -> str:
@@ -136,8 +119,8 @@ Response:"""
             return f"Error generating response: {str(e)}"
 
 class RAGSystem:
-    def __init__(self, embeddings_path: str, texts_path: str, faiss_index_path: str, batch_size: int = 1000):
-        self.document_store = DocumentStore(embeddings_path, texts_path, faiss_index_path, batch_size)
+    def __init__(self, embeddings_data: Dict, texts_data: Dict, faiss_index):
+        self.document_store = DocumentStore(embeddings_data, texts_data, faiss_index)
         self.rag_model = RAGModel(self.document_store)
         self.claude_enhancer = ClaudeEnhancer()
 
@@ -164,29 +147,59 @@ class RAGSystem:
                 "error": str(e)
             }
 
-# Streamlit UI
+@st.cache_resource
+def load_data():
+    try:
+        # Load embeddings
+        embeddings_data = st.session_state.embeddings_data
+        texts_data = st.session_state.texts_data
+        faiss_index = st.session_state.faiss_index
+        
+        return embeddings_data, texts_data, faiss_index
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return None, None, None
+
 def main():
     st.set_page_config(page_title="Legal Research Assistant", page_icon="⚖️", layout="wide")
     
     st.title("🔍 Legal Research Assistant")
     
-    # Sidebar
-    st.sidebar.header("Settings")
-    top_k = st.sidebar.slider("Number of relevant documents", min_value=1, max_value=10, value=3)
-    
-    # Initialize session state
-    if 'rag_system' not in st.session_state:
-        with st.spinner("Initializing the system..."):
+    # File upload section in sidebar
+    with st.sidebar:
+        st.header("📁 File Upload")
+        embeddings_file = st.file_uploader("Upload embeddings JSON", type="json")
+        texts_file = st.file_uploader("Upload texts JSON", type="json")
+        faiss_file = st.file_uploader("Upload FAISS index")
+        
+        if embeddings_file and texts_file and faiss_file:
             try:
-                st.session_state.rag_system = RAGSystem(
-                    embeddings_path=r"C:\themis\pdf_embeddings.json",
-                    texts_path=r"C:\themis\pdf_texts.json",
-                    faiss_index_path=r"C:\themis\legal_docs_index.faiss"
-                )
-                st.sidebar.success("System initialized successfully!")
+                # Save uploads to session state
+                st.session_state.embeddings_data = json.load(embeddings_file)
+                st.session_state.texts_data = json.load(texts_file)
+                
+                # Save FAISS index to a temporary file and load it
+                faiss_bytes = faiss_file.read()
+                temp_faiss_path = "temp_index.faiss"
+                with open(temp_faiss_path, "wb") as f:
+                    f.write(faiss_bytes)
+                st.session_state.faiss_index = faiss.read_index(temp_faiss_path)
+                os.remove(temp_faiss_path)  # Clean up
+                
+                st.success("All files loaded successfully!")
             except Exception as e:
-                st.sidebar.error(f"Error initializing system: {str(e)}")
-                return
+                st.error(f"Error loading files: {str(e)}")
+    
+    # Main content
+    if not all(hasattr(st.session_state, attr) for attr in ['embeddings_data', 'texts_data', 'faiss_index']):
+        st.warning("Please upload all required files in the sidebar to continue.")
+        return
+    
+    # Initialize RAG system
+    if 'rag_system' not in st.session_state:
+        embeddings_data, texts_data, faiss_index = load_data()
+        if all([embeddings_data, texts_data, faiss_index]):
+            st.session_state.rag_system = RAGSystem(embeddings_data, texts_data, faiss_index)
     
     # Query input
     query = st.text_area("Enter your legal research query:", height=100)
@@ -201,7 +214,7 @@ def main():
     if search_button and query:
         with st.spinner("Searching and analyzing..."):
             start_time = time.time()
-            results = st.session_state.rag_system.process_query(query, top_k)
+            results = st.session_state.rag_system.process_query(query, top_k=3)
             end_time = time.time()
             
             st.session_state.last_results = results
@@ -232,10 +245,6 @@ def main():
             for i, doc in enumerate(results['relevant_documents'], 1):
                 with st.expander(f"Document {i}: {doc['id']} (Similarity: {doc['similarity']:.4f})"):
                     st.text_area("Content:", doc['text'], height=200)
-
-    # Footer
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("Made with ❤️ by Your Themis Legal Tech Team")
 
 if __name__ == "__main__":
     main()
