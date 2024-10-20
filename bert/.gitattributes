@@ -1,3 +1,6 @@
 bert/pdf_embeddings.json filter=lfs diff=lfs merge=lfs -text
 <path_to_pdf_embeddings.json> filter=lfs diff=lfs merge=lfs -text
 pdf_embeddings.json filter=lfs diff=lfs merge=lfs -text
+weakly_labeled_data.json filter=lfs diff=lfs merge=lfs -text
+pdf_texts.json filter=lfs diff=lfs merge=lfs -text
+legal_docs_index.faiss filter=lfs diff=lfs merge=lfs -text
